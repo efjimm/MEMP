@@ -20,17 +20,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .openssl = true,
     });
-    const router = b.dependency("zig-router", .{
-        .target = target,
-        .optimize = optimize,
-    });
     const sqlite = b.dependency("sqlite", .{
         .target = target,
         .optimize = optimize,
     });
     exe.root_module.addImport("zap", zap.module("zap"));
     exe.linkLibrary(zap.artifact("facil.io"));
-    exe.root_module.addImport("zig-router", router.module("zig-router"));
     exe.root_module.addImport("sqlite", sqlite.module("sqlite"));
 
     const mqtt_dep = b.dependency("mqtt", .{});
