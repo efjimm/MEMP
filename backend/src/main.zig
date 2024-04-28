@@ -7,122 +7,22 @@ const log = std.log;
 const posix = std.posix;
 
 const zig_router = @import("zig-router");
-const Router = @import("zig-router").Router;
-const Route = @import("zig-router").Route;
 
 const zap = @import("zap");
 const Mustache = zap.Mustache;
-const Sockets = zap.WebSockets;
 
 const sqlite = @import("sqlite");
 
-const SocketHandler = Sockets.Handler(SocketContext);
-
-const SocketContext = struct {
-    value: u32 = 0,
-    subscribe_args: SocketHandler.SubscribeArgs,
-    settings: SocketHandler.WebSocketSettings,
-};
-
-fn onUpgrade(r: zap.Request, target_protocol: []const u8) void {
-    if (!std.mem.eql(u8, target_protocol, "websocket")) {
-        log.warn("Received illegal protocol {s}", .{target_protocol});
-        r.setStatus(.bad_request);
-        r.sendBody("400 - BAD REQUEST") catch {};
-        return;
+fn index(r: zap.Request) void {
+    const template = @embedFile("template.html");
+    var m = Mustache.fromData(template) catch return;
+    defer m.deinit();
+    const ret = m.build(.{});
+    if (ret.str()) |str| {
+        r.sendBody(str) catch {};
+    } else {
+        r.sendBody("Not found") catch {};
     }
-
-    const context = gpa.allocator().create(SocketContext) catch |err| {
-        log.err("Could not create socket context: {}", .{err});
-        return;
-    };
-    context.* = .{
-        .subscribe_args = .{
-            .channel = "sensor-data",
-            .force_text = true,
-            .context = context,
-        },
-        .settings = .{
-            .on_open = onOpenWebsocket,
-            .on_close = onCloseWebsocket,
-            .context = context,
-        },
-    };
-
-    SocketHandler.upgrade(r.h, &context.settings) catch |err| {
-        log.err("Could not upgrade connection: {}", .{err});
-        return;
-    };
-}
-
-fn onOpenWebsocket(context: ?*SocketContext, handle: Sockets.WsHandle) void {
-    const ctx = context orelse return;
-
-    _ = SocketHandler.subscribe(handle, &ctx.subscribe_args) catch |err| {
-        std.log.err("Error opening websocket: {}", .{err});
-        return;
-    };
-
-    log.info("Opened websocket", .{});
-}
-
-fn onCloseWebsocket(context: ?*SocketContext, _: isize) void {
-    if (context) |ctx| {
-        gpa.allocator().destroy(ctx);
-    }
-    log.info("Closing websocket", .{});
-}
-
-fn sendSensorData() void {
-    var r = std.rand.DefaultPrng.init(1_000_001);
-    const rand = r.random();
-
-    while (running.load(.unordered)) {
-        const value = rand.int(u8);
-
-        var buf: [21]u8 = undefined;
-        const slice = std.fmt.bufPrint(&buf, "{d}", .{value}) catch unreachable;
-
-        SocketHandler.publish(.{ .channel = "sensor-data", .message = slice });
-
-        std.time.sleep(std.time.ns_per_ms * 500);
-    }
-}
-
-const App = struct {
-    fn index(r: zap.Request) void {
-        const template = @embedFile("template.html");
-        var m = Mustache.fromData(template) catch return;
-        defer m.deinit();
-        const ret = m.build(.{
-            .name = "friend",
-        });
-        if (ret.str()) |str| {
-            r.sendBody(str) catch {};
-        } else {
-            r.sendBody("Not found") catch {};
-        }
-    }
-};
-
-fn onRequest(r: zap.Request) void {
-    const method_str = r.method orelse {
-        log.warn("Empty method string", .{});
-        return;
-    };
-
-    const router = Router(.{}, .{
-        Route(.GET, "/", App.index, .{}),
-    });
-
-    const request: router.Request = .{
-        .method = @enumFromInt(zig_router.Method.parse(method_str)),
-        .path = r.path orelse "/",
-    };
-
-    router.match(gpa.allocator(), request, .{r}) catch |err| {
-        log.err("Match {}", .{err});
-    };
 }
 
 var gpa: std.heap.GeneralPurposeAllocator(.{
@@ -140,10 +40,16 @@ pub fn main() !void {
         .flags = 0,
     }, null);
 
+    var db = try sqlite.Db.init(.{
+        .mode = .{ .File = "data.db" },
+        .open_flags = .{ .write = true, .create = true },
+    });
+    defer db.deinit();
+
     const mqtt_socket = try std.net.tcpConnectToHost(
         gpa.allocator(),
-        // "ec2-13-60-15-160.eu-north-1.compute.amazonaws.com",
-        "127.0.0.1",
+        "ec2-13-60-15-160.eu-north-1.compute.amazonaws.com",
+        // "127.0.0.1",
         1883,
     );
     defer mqtt_socket.close();
@@ -164,55 +70,141 @@ pub fn main() !void {
         @ptrCast(&publishCallback),
     );
 
+    client.publish_response_callback_state = &db;
+
     _ = c.mqtt_connect(&client, "backend", null, null, 0, null, null, c.MQTT_CONNECT_CLEAN_SESSION, 400);
     if (client.@"error" != c.MQTT_OK) return error.MqttConnectFailure;
+    defer _ = c.mqtt_disconnect(&client);
 
     inline for (2..7) |i| {
         _ = c.mqtt_subscribe(&client, std.fmt.comptimePrint("stations/M{d}", .{i}), 0);
     }
 
     const thread = try std.Thread.spawn(.{}, mqttSync, .{&client});
-    defer thread.join();
+    defer {
+        running.store(false, .unordered);
+        thread.join();
+    }
 
-    var db = try sqlite.Db.init(.{
-        .mode = .{ .File = "data.db" },
-        .open_flags = .{ .write = true, .create = true },
+    const sql_init =
+        \\CREATE TABLE IF NOT EXISTS datapoints (
+        \\  station_id TEXT,
+        \\  callsign TEXT,
+        \\  longitude REAL,
+        \\  latitude REAL,
+        \\  time TEXT,
+        \\  atmospheric_pressure REAL,
+        \\  wind_direction REAL,
+        \\  wind_speed REAL,
+        \\  gust REAL REAL,
+        \\  wave_height REAL,
+        \\  wave_period REAL,
+        \\  mean_wave_direction REAL,
+        \\  hmax REAL,
+        \\  air_temperature REAL,
+        \\  dew_point REAL,
+        \\  sea_temperature REAL,
+        \\  salinity REAL,
+        \\  relative_humidity REAL,
+        \\  spr_tp REAL,
+        \\  th_tp REAL,
+        \\  tp REAL,
+        \\  qc_flag INTEGER
+        \\);
+    ;
+
+    var diags: sqlite.Diagnostics = .{};
+    errdefer |err| if (err == error.SQLiteError) log.err("{}\n", .{diags});
+
+    var init_stmt = try db.prepareWithDiags(sql_init, .{ .diags = &diags });
+    defer init_stmt.deinit();
+
+    try init_stmt.exec(.{}, .{});
+
+    var router = zap.Router.init(gpa.allocator(), .{});
+    defer router.deinit();
+
+    try router.handle_func_unbound("/", &index);
+
+    var listener = zap.HttpListener.init(.{
+        .port = 3000,
+        .on_request = router.on_request_handler(),
+        .log = true,
+        .max_clients = 100_000,
+        .public_folder = "public",
     });
-    defer db.deinit();
+    try listener.listen();
 
-    // var listener = zap.HttpListener.init(.{
-    //     .port = 3000,
-    //     .on_request = onRequest,
-    //     .on_upgrade = onUpgrade,
-    //     .log = true,
-    //     .max_clients = 100_000,
-    //     .public_folder = "public",
-    // });
-    // try listener.listen();
+    log.info("Listening on 0.0.0.0:3000\n", .{});
 
-    // std.debug.print("Listening on 0.0.0.0:3000\n", .{});
-
-    // const sender = try std.Thread.spawn(.{}, sendSensorData, .{});
-
-    // // start worker threads
-    // zap.start(.{
-    //     .threads = 2,
-    //     .workers = 1,
-    // });
-
-    // running.store(false, .unordered);
-
-    // sender.join();
+    // start worker threads
+    zap.start(.{
+        .threads = 2,
+        .workers = 1,
+    });
 }
 
-pub fn publishCallback(_: *anyopaque, data: *c.mqtt_response_publish) callconv(.C) void {
-    const topic_ptr: [*]const u8 = @ptrCast(data.topic_name);
-    const topic = topic_ptr[0..data.topic_name_size];
+const Row = struct {
+    id: []const u8,
+    callsign: []const u8,
+    longitude: f64,
+    latitude: f64,
+    time: []const u8,
+    atmospheric_pressure: f64,
+    wind_direction: f64,
+    wind_speed: f64,
+    gust: f64,
+    wave_height: f64,
+    wave_period: f64,
+    mean_wave_direction: f64,
+    hmax: f64,
+    air_temperature: f64,
+    dew_point: f64,
+    sea_temperature: f64,
+    salinity: f64,
+    relative_humidity: f64,
+    spr_tp: f64,
+    th_tp: f64,
+    tp: f64,
+    qc_flag: i64,
+};
+
+pub fn publishCallback(ctx: **sqlite.Db, data: *c.mqtt_response_publish) callconv(.C) void {
+    const db = ctx.*;
 
     const message_ptr: [*]const u8 = @ptrCast(data.application_message);
     const message = message_ptr[0..data.application_message_size];
 
-    std.debug.print("{s}: {s}\n", .{ topic, message });
+    log.debug("MQTT publish '{s}'\n", .{message});
+
+    const sql_insert =
+        \\INSERT INTO datapoints (station_id, callsign, longitude, latitude, time, atmospheric_pressure, wind_direction, wind_speed, gust, wave_height, wave_period, mean_wave_direction, hmax, air_temperature, dew_point, sea_temperature, salinity, relative_humidity, spr_tp, th_tp, tp, qc_flag)
+    ++ "VALUES(" ++ ("?, " ** (@typeInfo(Row).Struct.fields.len - 1)) ++ "?);";
+
+    var diags: sqlite.Diagnostics = .{};
+
+    var stmt = db.prepareWithDiags(sql_insert, .{ .diags = &diags }) catch |err| {
+        log.err("{}: {}\n", .{ err, diags });
+        return;
+    };
+    defer stmt.deinit();
+
+    // Value lines
+    var iter = std.mem.tokenizeScalar(u8, message, ',');
+
+    // Parse comma separated values into an instance of `Row`, to be passed as the bind parameters
+    var row: Row = undefined;
+    inline for (@typeInfo(Row).Struct.fields) |field| {
+        const str = iter.next() orelse return;
+        @field(row, field.name) = switch (@typeInfo(field.type)) {
+            .Float => std.fmt.parseFloat(field.type, str) catch return,
+            .Int => std.fmt.parseInt(field.type, str, 0) catch return,
+            else => str,
+        };
+    }
+
+    stmt.exec(.{}, row) catch return;
+    stmt.reset();
 }
 
 fn mqttSync(client: *c.mqtt_client) void {
