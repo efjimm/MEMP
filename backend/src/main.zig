@@ -8,34 +8,21 @@ const log = std.log;
 const posix = std.posix;
 const assert = std.debug.assert;
 
-const zig_router = @import("zig-router");
-
-const zap = @import("zap");
-const Mustache = zap.Mustache;
-
 const sqlite = @import("sqlite");
 
-// fn index(r: zap.Request) void {
-//     const template = @embedFile("template.html");
-//     var m = Mustache.fromData(template) catch return;
-//     defer m.deinit();
-//     const ret = m.build(.{});
-//     if (ret.str()) |str| {
-//         r.sendBody(str) catch {};
-//     } else {
-//         r.sendBody("Not found") catch {};
-//     }
-// }
+var gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }) = .{};
 
-var gpa: std.heap.GeneralPurposeAllocator(.{
-    .thread_safe = true,
-}) = .{};
-
-/// Atomic bool used for signalling threads to stop.
 var running = std.atomic.Value(bool).init(true);
 
 pub fn main() !void {
     defer _ = gpa.deinit();
+
+    var args = std.process.args();
+    _ = args.skip();
+
+    // TODO: Write a proper usage string
+    const mqtt_broker_host = args.next() orelse return error.NotEnoughArguments;
+    const db_filepath = args.next() orelse return error.NotEnoughArguments;
 
     // Register SIGINT handler
     try posix.sigaction(posix.SIG.INT, &.{
@@ -44,37 +31,21 @@ pub fn main() !void {
         .flags = 0,
     }, null);
 
-    var db = try initDb("/opt/memp/data.db");
+    log.info("opening db", .{});
+    var db = try initDb(db_filepath);
     defer db.deinit();
 
     var recv_buf: [4096]u8 = undefined;
     var send_buf: [4096]u8 = undefined;
-    var mqtt = try MqttClient.init(&db, &send_buf, &recv_buf);
+    log.info("initializing MQTT client", .{});
+    var mqtt = try MqttClient.init(mqtt_broker_host, &db, &send_buf, &recv_buf);
     defer mqtt.deinit();
 
-    try mqtt.start();
-
-    var router = zap.Router.init(gpa.allocator(), .{});
-    defer router.deinit();
-
-    // try router.handle_func_unbound("/", &index);
-
-    var listener = zap.HttpListener.init(.{
-        .port = 3001,
-        .on_request = router.on_request_handler(),
-        .log = true,
-        .max_clients = 100_000,
-        .public_folder = "public",
-    });
-    try listener.listen();
-
-    log.info("Listening on 0.0.0.0:3000", .{});
-
-    // start worker threads
-    zap.start(.{
-        .threads = 2,
-        .workers = 1,
-    });
+    log.info("waiting for MQTT publishes", .{});
+    while (running.load(.unordered)) {
+        mqtt.sync();
+        std.time.sleep(std.time.ns_per_s);
+    }
 }
 
 const Row = struct {
@@ -156,7 +127,7 @@ pub fn sigintHandler(_: c_int) callconv(.C) void {
 }
 
 /// Initialize the SQLite database
-fn initDb(filepath: []const u8) !sqlite.Db {
+fn initDb(filepath: [:0]const u8) !sqlite.Db {
     var db = try sqlite.Db.init(.{
         .mode = .{ .File = filepath },
         .open_flags = .{ .write = true, .create = true },
@@ -205,16 +176,10 @@ fn initDb(filepath: []const u8) !sqlite.Db {
 const MqttClient = struct {
     socket: std.net.Stream,
     c_client: c.mqtt_client,
-    sync_thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    pub fn init(db: *sqlite.Db, send_buf: []u8, recv_buf: []u8) !MqttClient {
-        const mqtt_socket = try std.net.tcpConnectToHost(
-            gpa.allocator(),
-            "ec2-13-60-15-160.eu-north-1.compute.amazonaws.com",
-            // "127.0.0.1",
-            1883,
-        );
+    pub fn init(mqtt_host: []const u8, db: *sqlite.Db, send_buf: []u8, recv_buf: []u8) !MqttClient {
+        const mqtt_socket = try std.net.tcpConnectToHost(gpa.allocator(), mqtt_host, 1883);
         errdefer mqtt_socket.close();
         _ = try posix.fcntl(mqtt_socket.handle, posix.F.SETFL, std.os.linux.SOCK.NONBLOCK);
 
@@ -234,6 +199,8 @@ const MqttClient = struct {
         if (client.@"error" != c.MQTT_OK) return error.MqttConnectFailure;
         errdefer _ = c.mqtt_disconnect(&client);
 
+        // TODO: Listen on only one channel and accept any station id value. This would allow
+        //       adding new stations without recompiling this.
         // Subscribe to stations M2-M6
         inline for (2..7) |i| {
             _ = c.mqtt_subscribe(&client, std.fmt.comptimePrint("stations/M{d}", .{i}), 0);
@@ -242,30 +209,16 @@ const MqttClient = struct {
         return .{
             .socket = mqtt_socket,
             .c_client = client,
-            .sync_thread = null,
         };
-    }
-
-    pub fn start(client: *MqttClient) !void {
-        assert(client.sync_thread == null);
-        client.running.store(true, .unordered);
-        client.sync_thread = try std.Thread.spawn(.{}, mqttSync, .{client});
     }
 
     pub fn deinit(client: *MqttClient) void {
         _ = c.mqtt_disconnect(&client.c_client);
         client.socket.close();
         client.running.store(false, .unordered);
-        if (client.sync_thread) |thread| thread.join();
     }
 
-    /// The `c.mqtt_sync` function does the actual message ingest from the MQTT broker, and
-    /// needs to be called preiodically. The function is thread-safe so it's done in a separate
-    /// thread 5 times per second.
-    fn mqttSync(client: *MqttClient) void {
-        while (running.load(.unordered)) {
-            _ = c.mqtt_sync(&client.c_client);
-            std.time.sleep(std.time.ns_per_ms * 200);
-        }
+    fn sync(client: *MqttClient) void {
+        _ = c.mqtt_sync(&client.c_client);
     }
 };

@@ -15,17 +15,10 @@ pub fn build(b: *std.Build) void {
         .use_lld = !use_native,
     });
 
-    const zap = b.dependency("zap", .{
-        .target = target,
-        .optimize = optimize,
-        .openssl = true,
-    });
     const sqlite = b.dependency("sqlite", .{
         .target = target,
         .optimize = optimize,
     });
-    exe.root_module.addImport("zap", zap.module("zap"));
-    exe.linkLibrary(zap.artifact("facil.io"));
     exe.root_module.addImport("sqlite", sqlite.module("sqlite"));
 
     const mqtt_dep = b.dependency("mqtt", .{});
