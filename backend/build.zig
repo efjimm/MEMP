@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.linkLibrary(mqtt);
     exe.root_module.addIncludePath(mqtt_dep.path("include"));
+    exe.linkLibC();
 
     b.installArtifact(exe);
 
