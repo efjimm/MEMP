@@ -23,6 +23,7 @@ def publish_data():
 
     # Remove first two lines, which are the column names and measurement units
     data = data.split('\n', 2)[2]
+    print(f'publish "{data}"')
     mqttc.publish("station_data", data)
 
 # See https://erddap.marine.ie/erddap/rest.html and
