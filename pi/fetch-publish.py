@@ -21,13 +21,9 @@ def publish_data():
     data = fetch_data()
     if data is None: return
 
-    lines = data.split('\n')
-    for line in lines[2:]: # Skip first two lines, which are the column names and measurement units
-        if len(line) == 0: continue
-
-        values = line.split(',')
-        print(f'publishing on stations/{values[0]}: {line}')
-        mqttc.publish(f'stations/{values[0]}', line)
+    # Remove first two lines, which are the column names and measurement units
+    data = data.split('\n', 2)[2]
+    mqttc.publish("station_data", data)
 
 # See https://erddap.marine.ie/erddap/rest.html and
 # https://erddap.marine.ie/erddap/tabledap/documentation.html

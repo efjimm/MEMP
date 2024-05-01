@@ -95,31 +95,36 @@ pub fn publishCallback(ctx: **sqlite.Db, data: *c.mqtt_response_publish) callcon
     };
     defer stmt.deinit();
 
-    // Value lines
-    var iter = std.mem.tokenizeScalar(u8, message, ',');
+    var lines = std.mem.tokenizeScalar(u8, message, '\n');
+    lines: while (lines.next()) |line| {
+        var iter = std.mem.tokenizeScalar(u8, line, ',');
 
-    // Parse comma separated values into an instance of `Row`, to be passed as the bind parameters
-    var row: Row = undefined;
-    inline for (@typeInfo(Row).Struct.fields) |field| {
-        const str = iter.next() orelse return;
+        // Parse comma separated values into an instance of `Row`, to be passed as the bind parameters
+        var row: Row = undefined;
+        inline for (@typeInfo(Row).Struct.fields) |field| {
+            const str = iter.next() orelse continue :lines;
 
-        // Store time as an integer timestamp rather than a string
-        if (comptime std.mem.eql(u8, field.name, "time")) {
-            var tm: c.tm = .{};
-            _ = c.strptime(str.ptr, "%FT%T%z", &tm);
-            row.time = c.mktime(&tm);
-            continue;
+            // Store time as an integer timestamp rather than a string
+            if (comptime std.mem.eql(u8, field.name, "time")) {
+                var tm: c.tm = .{};
+                _ = c.strptime(str.ptr, "%FT%T%z", &tm);
+                row.time = c.mktime(&tm);
+                continue;
+            }
+
+            @field(row, field.name) = switch (@typeInfo(field.type)) {
+                .Float => std.fmt.parseFloat(field.type, str) catch continue :lines,
+                .Int => std.fmt.parseInt(field.type, str, 0) catch continue :lines,
+                else => str,
+            };
         }
 
-        @field(row, field.name) = switch (@typeInfo(field.type)) {
-            .Float => std.fmt.parseFloat(field.type, str) catch return,
-            .Int => std.fmt.parseInt(field.type, str, 0) catch return,
-            else => str,
+        stmt.reset();
+        stmt.exec(.{}, row) catch |err| {
+            log.err("{}", .{err});
+            continue;
         };
     }
-
-    stmt.exec(.{}, row) catch return;
-    stmt.reset();
 }
 
 /// Handle ctrl-c nicely
@@ -201,12 +206,7 @@ const MqttClient = struct {
         if (client.@"error" != c.MQTT_OK) return error.MqttConnectFailure;
         errdefer _ = c.mqtt_disconnect(&client);
 
-        // TODO: Listen on only one channel and accept any station id value. This would allow
-        //       adding new stations without recompiling this.
-        // Subscribe to stations M2-M6
-        inline for (2..7) |i| {
-            _ = c.mqtt_subscribe(&client, std.fmt.comptimePrint("stations/M{d}", .{i}), 0);
-        }
+        _ = c.mqtt_subscribe(&client, "station_data", 0);
 
         return .{
             // .socket = mqtt_socket,
