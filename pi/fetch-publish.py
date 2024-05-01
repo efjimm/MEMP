@@ -4,6 +4,7 @@ import json
 import urllib.parse
 
 import paho.mqtt.client as mqtt
+import ssl
 import schedule
 import time
 import sys
@@ -42,10 +43,12 @@ def publish_data():
 query = urllib.parse.quote_plus('&station_id=~"M[2-6]"&orderByMax("station_id,time")')
 
 mqttc = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+mqttc.tls_set('/etc/ssl/certs/ca-certificates.crt', tls_version=ssl.PROTOCOL_TLSv1_2)
 
 try:
-    mqttc.connect("ec2-13-60-15-160.eu-north-1.compute.amazonaws.com", 1883)
-    # mqttc.connect("127.0.0.1", 1883)
+    print('Connecting to MQTT broker...', end='', flush=True)
+    mqttc.connect("iot-mqtt-broker.duckdns.org", 1884)
+    print(' Done')
     mqttc.loop_start()
 except Exception as e:
     print("Connection failed: " + str(e))
@@ -54,12 +57,14 @@ except Exception as e:
 schedule.every(30).minutes.do(publish_data)
 
 try:
+    print('Running...', end='', flush=True)
     while True:
         schedule.run_pending()
         time.sleep(10)
 except KeyboardInterrupt:
     pass
 finally:
+    print(' Done')
     mqttc.loop_stop()
     mqttc.disconnect()
 
