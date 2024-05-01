@@ -30,6 +30,20 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const lib = b.addStaticLibrary(.{
+        .name = "ssl_sockets",
+        .target = target,
+        .optimize = optimize,
+    });
+    lib.addCSourceFile(.{ .file = b.path("src/sockets_openssl.c") });
+    lib.linkLibC();
+    lib.linkSystemLibrary("openssl");
+    exe.linkSystemLibrary("openssl");
+
+    exe.linkLibrary(lib);
+    exe.root_module.addCMacro("MQTT_USE_BIO", "1");
+    exe.addIncludePath(b.path("src"));
+
     const step = b.step("run", "Run the program");
     const run_step = b.addRunArtifact(exe);
     step.dependOn(&run_step.step);
@@ -54,6 +68,7 @@ fn compileMqtt(
     lib.addCSourceFile(.{ .file = dep.path("src/mqtt_pal.c") });
     lib.linkLibC();
     lib.addIncludePath(dep.path("include"));
+    lib.root_module.addCMacro("MQTT_USE_BIO", "1");
 
     return lib;
 }

@@ -3,6 +3,7 @@ const c = @cImport({
     @cDefine("_XOPEN_SOURCE", "1");
     @cInclude("mqtt.h");
     @cInclude("time.h");
+    @cInclude("sockets_openssl.h");
 });
 const log = std.log;
 const posix = std.posix;
@@ -174,19 +175,20 @@ fn initDb(filepath: [:0]const u8) !sqlite.Db {
 }
 
 const MqttClient = struct {
-    socket: std.net.Stream,
+    socket: ?*c.BIO = null,
     c_client: c.mqtt_client,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    pub fn init(mqtt_host: []const u8, db: *sqlite.Db, send_buf: []u8, recv_buf: []u8) !MqttClient {
-        const mqtt_socket = try std.net.tcpConnectToHost(gpa.allocator(), mqtt_host, 1883);
-        errdefer mqtt_socket.close();
-        _ = try posix.fcntl(mqtt_socket.handle, posix.F.SETFL, std.os.linux.SOCK.NONBLOCK);
+    pub fn init(mqtt_host: [:0]const u8, db: *sqlite.Db, send_buf: []u8, recv_buf: []u8) !MqttClient {
+        var ssl_ctx: ?*c.SSL_CTX = undefined;
+        var bio: ?*c.BIO = undefined;
+        c.open_nb_socket(&bio, &ssl_ctx, mqtt_host.ptr, "1884", "/etc/ssl/certs/ca-certificates.crt", null, null, null);
 
         var client: c.mqtt_client = .{};
         _ = c.mqtt_init(
             &client,
-            mqtt_socket.handle,
+            bio,
+            // mqtt_socket.handle,
             send_buf.ptr,
             send_buf.len,
             recv_buf.ptr,
@@ -207,14 +209,16 @@ const MqttClient = struct {
         }
 
         return .{
-            .socket = mqtt_socket,
+            // .socket = mqtt_socket,
+            .socket = bio,
             .c_client = client,
         };
     }
 
     pub fn deinit(client: *MqttClient) void {
         _ = c.mqtt_disconnect(&client.c_client);
-        client.socket.close();
+        // client.socket.close();
+        if (client.socket) |s| c.BIO_free_all(s);
         client.running.store(false, .unordered);
     }
 
