@@ -16,3 +16,7 @@ marine data.
 
 Head over to [Getting Started]({{ site.baseurl }}{% link getting-started.markdown %}) for information on
 how to start setting up MEMP.
+
+# Example dashboard
+
+<iframe src="https://memp-data.duckdns.org/public-dashboards/aa798faefe7a43f7b86252a8d3c1711a" width="800" height="800"></iframe>
