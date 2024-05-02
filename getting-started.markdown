@@ -290,11 +290,14 @@ Grafana needs to be configured to use https. Add these lines to `/etc/grafana/gr
 protocol = https
 cert_file = /path/to/fullchain.pem
 cert_key = /path/to/key.pem
+allow_embedding = true
 ```
 
 The certificate files need the correct permissions for Grafana to be able to read them. You can
 check if Grafana is able to read them by running `$ sudo journalctl -u grafana-server` after
 restarting grafana.
+
+The `allow_embedding` option allows public dashboards to be embedded in iframes.
 
 Enable the service on startup:
 
